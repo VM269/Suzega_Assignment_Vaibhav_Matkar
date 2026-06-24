@@ -1,0 +1,92 @@
+name: Roll Back Inference Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target environment for rollback
+        required: true
+        default: qa
+        type: choice
+        options:
+          - qa
+          - preprod
+          - prod
+      deployment:
+        description: Kubernetes deployment to roll back
+        required: true
+        default: inference-service
+      namespace:
+        description: Kubernetes namespace
+        required: true
+        default: inference
+
+env:
+  GCP_PROJECT_QA: flowvelly-healthcare-qa
+  GCP_PROJECT_PREPROD: flowvelly-healthcare-preprod
+  GCP_PROJECT_PROD: flowvelly-healthcare-prod
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Configure gcloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.GCP_PROJECT_QA }}
+          export_default_credentials: true
+      - name: Compute rollback target
+        id: target-settings
+        run: |
+          case "${{ github.event.inputs.target }}" in
+            qa)
+              echo "PROJECT=${GCP_PROJECT_QA}" >> $GITHUB_OUTPUT
+              echo "CLUSTER_NAME=${{ secrets.QA_CLUSTER_NAME }}" >> $GITHUB_OUTPUT
+              echo "CLUSTER_LOCATION=${{ secrets.QA_CLUSTER_LOCATION }}" >> $GITHUB_OUTPUT
+              ;;
+            preprod)
+              echo "PROJECT=${GCP_PROJECT_PREPROD}" >> $GITHUB_OUTPUT
+              echo "CLUSTER_NAME=${{ secrets.PREPROD_CLUSTER_NAME }}" >> $GITHUB_OUTPUT
+              echo "CLUSTER_LOCATION=${{ secrets.PREPROD_CLUSTER_LOCATION }}" >> $GITHUB_OUTPUT
+              ;;
+            prod)
+              echo "PROJECT=${GCP_PROJECT_PROD}" >> $GITHUB_OUTPUT
+              echo "CLUSTER_NAME=${{ secrets.PROD_CLUSTER_NAME }}" >> $GITHUB_OUTPUT
+              echo "CLUSTER_LOCATION=${{ secrets.PROD_CLUSTER_LOCATION }}" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "Unsupported target" >&2
+              exit 1
+              ;;
+          esac
+      - name: Get cluster credentials
+        run: |
+          gcloud container clusters get-credentials "${{ steps.target-settings.outputs.CLUSTER_NAME }}" \
+            --region "${{ steps.target-settings.outputs.CLUSTER_LOCATION }}" \
+            --project "${{ steps.target-settings.outputs.PROJECT }}"
+      - name: Roll back deployment
+        run: |
+          kubectl rollout undo deployment/${{ github.event.inputs.deployment }} --namespace "${{ github.event.inputs.namespace }}"
+          kubectl rollout status deployment/${{ github.event.inputs.deployment }} --namespace "${{ github.event.inputs.namespace }}" --timeout=120s
+      - name: Upload rollback audit evidence
+        run: |
+          mkdir -p audit
+          cat > audit/rollback-evidence.txt <<'EOF'
+          who: $GITHUB_ACTOR
+          what: rollback in ${{ github.event.inputs.target }}
+          when: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          deployment: ${{ github.event.inputs.deployment }}
+          namespace: ${{ github.event.inputs.namespace }}
+          workflow: $GITHUB_WORKFLOW
+          run_id: $GITHUB_RUN_ID
+          EOF
+      - uses: actions/upload-artifact@v3
+        with:
+          name: rollback-audit
+          path: audit/rollback-evidence.txt
